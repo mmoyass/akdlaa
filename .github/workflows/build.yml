@@ -1,0 +1,37 @@
+name: Build DLAA addon
+
+on:
+  workflow_dispatch:
+  push:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get ReShade headers
+        run: git clone --depth 1 https://github.com/crosire/reshade.git C:\reshade
+
+      - name: Get NVIDIA DLSS SDK
+        run: git clone --depth 1 https://github.com/NVIDIA/DLSS.git C:\DLSS
+
+      - name: Show SDK layout (for debugging)
+        run: |
+          dir C:\DLSS
+          dir C:\DLSS\lib\Windows_x86_64 -Recurse -Filter *.lib
+          dir C:\DLSS\lib\Windows_x86_64 -Recurse -Filter nvngx_dlss.dll
+
+      - name: Configure
+        run: cmake -B build -G "Visual Studio 17 2022" -A x64 -DRESHADE_INC=C:/reshade/include -DNGX_ROOT=C:/DLSS
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Upload result
+        uses: actions/upload-artifact@v4
+        with:
+          name: dlaa-addon
+          path: |
+            build/Release/dlaa.addon64
+            C:/DLSS/lib/Windows_x86_64/rel/nvngx_dlss.dll
