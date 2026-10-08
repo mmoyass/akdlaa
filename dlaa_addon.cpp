@@ -191,7 +191,7 @@ static bool on_draw(command_list *cmd, uint32_t, uint32_t, uint32_t, uint32_t) {
     return false; // don't block the draw
 }
 
-static void on_present(command_queue *, swapchain *) {
+   static void on_present(command_queue *, swapchain *, const rect *, const rect *, uint32_t, const rect *) {
     g_drawIndex = 0;
     ++g_frame;
     NextJitter();
