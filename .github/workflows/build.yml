@@ -23,7 +23,7 @@ jobs:
           dir C:\DLSS\lib\Windows_x86_64 -Recurse -Filter nvngx_dlss.dll
 
       - name: Configure
-        run: cmake -B build -G "Visual Studio 17 2022" -A x64 -DRESHADE_INC=C:/reshade/include -DNGX_ROOT=C:/DLSS
+           run: cmake -B build -A x64 -DRESHADE_INC=C:/reshade/include -DNGX_ROOT=C:/DLSS
 
       - name: Build
         run: cmake --build build --config Release
