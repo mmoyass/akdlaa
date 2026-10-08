@@ -100,6 +100,8 @@ static ID3D11ShaderResourceView *g_depthSRV = nullptr;
 static uint32_t g_bbW = 0, g_bbH = 0;
 static uint32_t g_frame = 0, g_dispatchCount = 0, g_matchCount = 0;
 static bool g_done = false, g_reset = true, g_haveView = false, g_failed = false, g_inside = false;
+static bool g_enabled = true;
+static uint32_t g_applyCount = 0;
 static float g_curVP[16], g_prevVP[16];
 static float g_near = 10.0f;
 static float g_jx = 0, g_jy = 0;
@@ -133,7 +135,8 @@ static void ProcessViewConstants(float *c, size_t bytes) {
     float nz = fabsf(c[20 * 4]);
     if (nz > 0.01f && nz < 10000.0f) g_near = nz;
     g_haveView = true;
-    if (cfg.applyJitter && g_bbW) {
+    if (cfg.applyJitter && g_enabled && g_bbW) {
+        ++g_applyCount;
         // clip.xy += jitter_ndc * clip.w  ->  col.xy += jitter_ndc * col.w for each of the 4 columns
         float jx = 2.0f * g_jx / (float)g_bbW;
         float jy = -2.0f * g_jy / (float)g_bbH;
@@ -455,7 +458,7 @@ static bool on_dispatch(command_list *cmd, uint32_t, uint32_t, uint32_t) {
 
     if (match) {
         uint32_t idx = g_matchCount++;
-        if ((int)idx == cfg.triggerIndex && !g_done && g_haveView) {
+        if ((int)idx == cfg.triggerIndex && !g_done && g_haveView && g_enabled) {
             g_inside = true;
             RunDLAA(ctx, tex);
             g_inside = false;
@@ -471,15 +474,36 @@ static void on_present(command_queue *, swapchain *sc, const rect *, const rect 
     g_bbW = rd.texture.width;
     g_bbH = rd.texture.height;
 
+    // hotkeys: F9 = DLAA on/off, F10 = reload dlaa.ini
+    static bool prev9 = false, prev10 = false;
+    bool d9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+    bool d10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+    if (d9 && !prev9) {
+        g_enabled = !g_enabled;
+        g_reset = true;
+        Log("F9: DLAA %s", g_enabled ? "ON" : "OFF");
+    }
+    if (d10 && !prev10) {
+        LoadConfig();
+        g_w = 0;               // forces the DLSS feature to be recreated
+        g_reset = true;
+        g_failed = (g_ngx == nullptr);
+        Log("F10: reloaded ini: TriggerIndex=%d HDR=%d Jitter=%d SignX=%.0f SignY=%.0f Swap=%d",
+            cfg.triggerIndex, cfg.hdrColor ? 1 : 0, cfg.applyJitter ? 1 : 0, cfg.jitterSignX, cfg.jitterSignY, cfg.swapMatrices ? 1 : 0);
+    }
+    prev9 = d9;
+    prev10 = d10;
+
     if ((int)g_frame == cfg.logFrame)
-        Log("frame %u summary: backbuffer %ux%u, haveView=%d, depth=%s, dlaaDone=%d, near=%.2f, dispatches=%u, matches=%u",
-            g_frame, g_bbW, g_bbH, g_haveView ? 1 : 0, g_depthTex ? "found" : "MISSING", g_done ? 1 : 0, g_near, g_dispatchCount, g_matchCount);
+        Log("frame %u summary: backbuffer %ux%u, haveView=%d, depth=%s, dlaaDone=%d, near=%.2f, dispatches=%u, matches=%u, jitterApplied=%u times (jx=%.3f jy=%.3f)",
+            g_frame, g_bbW, g_bbH, g_haveView ? 1 : 0, g_depthTex ? "found" : "MISSING", g_done ? 1 : 0, g_near, g_dispatchCount, g_matchCount, g_applyCount, g_jx, g_jy);
 
     ++g_frame;
     g_done = false;
     g_haveView = false;
     g_dispatchCount = 0;
     g_matchCount = 0;
+    g_applyCount = 0;
     uint32_t i = (g_frame % (uint32_t)cfg.phases) + 1;
     g_jx = Halton(i, 2) - 0.5f;
     g_jy = Halton(i, 3) - 0.5f;
