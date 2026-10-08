@@ -16,17 +16,14 @@ jobs:
       - name: Get NVIDIA DLSS SDK
         run: git clone --depth 1 https://github.com/NVIDIA/DLSS.git C:\DLSS
 
-      - name: Show SDK layout (for debugging)
-        run: |
-          dir C:\DLSS
-          dir C:\DLSS\lib\Windows_x86_64 -Recurse -Filter *.lib
-          dir C:\DLSS\lib\Windows_x86_64 -Recurse -Filter nvngx_dlss.dll
-
       - name: Configure
         run: cmake -B build -A x64 -DRESHADE_INC=C:/reshade/include -DNGX_ROOT=C:/DLSS
 
       - name: Build
         run: cmake --build build --config Release
+
+      - name: Collect files
+        run: Copy-Item C:\DLSS\lib\Windows_x86_64\rel\nvngx_dlss.dll build\Release\
 
       - name: Upload result
         uses: actions/upload-artifact@v4
@@ -34,4 +31,4 @@ jobs:
           name: dlaa-addon
           path: |
             build/Release/dlaa.addon64
-            C:/DLSS/lib/Windows_x86_64/rel/nvngx_dlss.dll
+            build/Release/nvngx_dlss.dll
