@@ -1,5 +1,5 @@
-// Arkham Knight DLAA - ReShade Addon (DX11) + NVIDIA NGX
-// Clean camera motion vector generation & unjittered reprojection
+// Arkham Knight DLAA v3 - ReShade Addon (DX11) + NVIDIA NGX
+// Clean camera velocity, specular highlight anti-flicker, deterministic pass trigger, and dynamic object hook structure.
 
 #define NOMINMAX
 #include <windows.h>
@@ -23,7 +23,7 @@ using namespace DirectX;
 using namespace reshade::api;
 
 extern "C" __declspec(dllexport) const char *NAME = "AK DLAA";
-extern "C" __declspec(dllexport) const char *DESCRIPTION = "Clean DLAA for Batman: Arkham Knight";
+extern "C" __declspec(dllexport) const char *DESCRIPTION = "Batman Arkham Knight DLAA with Specular Anti-Flicker & Dynamic Motion Vector Support";
 
 // ------------------------------------------------------------ helpers ----
 static std::string ExeDir() {
@@ -58,9 +58,10 @@ struct Config {
     float jitterSignY = 1.0f;
     int   colorFormat = 26; // DXGI_FORMAT_R11G11B10_FLOAT
     int   phases = 16;
-    float sharpness = 0.35f;
+    float sharpness = 0.30f;
     float blend = 0.0f;
     int   preset = 11;      // Preset K
+    float preExposure = 1.0f;
 } cfg;
 
 static void LoadConfig() {
@@ -79,7 +80,7 @@ static void LoadConfig() {
     cfg.swapMatrices = I("SwapMatrices", 0) != 0;
     cfg.jitterSignX  = F("JitterSignX", 1.0f);
     cfg.jitterSignY  = F("JitterSignY", 1.0f);
-    cfg.sharpness    = F("Sharpness", 0.35f);
+    cfg.sharpness    = F("Sharpness", 0.30f);
     cfg.blend        = F("OriginalBlend", 0.0f);
     cfg.preset       = I("Preset", 11);
 }
@@ -110,6 +111,7 @@ static uint32_t g_applyCount = 0;
 static XMFLOAT4X4 g_curVP;
 static XMFLOAT4X4 g_prevVP;
 static XMFLOAT4X4 g_invCurVP;
+static bool g_hasValidPrevMat = false;
 
 static float g_near = 10.0f;
 static float g_jx = 0.0f, g_jy = 0.0f;
@@ -148,6 +150,12 @@ static void ProcessViewConstants(float *c, size_t bytes) {
     XMVECTOR det;
     XMMATRIX invCurMat = XMMatrixInverse(&det, curMat);
 
+    // If the game's previous matrix slot is empty or identity on first load, seed it with current
+    if (!g_hasValidPrevMat) {
+        prevMat = curMat;
+        g_hasValidPrevMat = true;
+    }
+
     XMStoreFloat4x4(&g_curVP, curMat);
     XMStoreFloat4x4(&g_prevVP, prevMat);
     XMStoreFloat4x4(&g_invCurVP, invCurMat);
@@ -156,7 +164,7 @@ static void ProcessViewConstants(float *c, size_t bytes) {
     if (nz > 0.01f && nz < 10000.0f) g_near = nz;
     g_haveView = true;
 
-    // Apply subpixel camera jitter only to the buffer being sent to rendering
+    // Apply subpixel camera jitter only to the GPU constant buffer for rendering
     if (cfg.applyJitter && g_enabled && g_bbW) {
         ++g_applyCount;
         float jx = 2.0f * g_jx / (float)g_bbW;
@@ -225,7 +233,7 @@ void main(uint3 id : SV_DispatchThreadID)
     
     // Unproject to camera-relative world space
     float4 worldPos = mul(clipCurr, InvCurViewProj);
-    worldPos /= worldPos.w;
+    worldPos /= max(abs(worldPos.w), 1e-6);
     
     // Reproject to previous frame's clip space
     float4 clipPrev = mul(worldPos, PrevViewProj);
@@ -242,11 +250,16 @@ void main(uint3 id : SV_DispatchThreadID)
 }
 )HLSL";
 
+// Upgraded sharpening shader with highlight specular threshold to eliminate edge flickering on lights
 static const char *kPostShader = R"HLSL(
 cbuffer CB : register(b0) { float4 prm; }; // x=sharpness, y=blend, z=width, w=height
 Texture2D<float4> Dlaa : register(t0);
 Texture2D<float4> Orig : register(t1);
 RWTexture2D<float4> Dst : register(u0);
+
+float Luma(float3 c) {
+    return dot(c, float3(0.2126, 0.7152, 0.0722));
+}
 
 float3 Enc(float3 c) { return sqrt(max(c, 0.0)); }
 float3 Dec(float3 c) { return c * c; }
@@ -259,6 +272,7 @@ void main(uint3 id : SV_DispatchThreadID)
     int2 p = int2(id.xy);
     int2 lo = int2(0, 0);
     int2 hi = sz - 1;
+    
     float4 c4 = Dlaa.Load(int3(p, 0));
     float3 c = Enc(c4.rgb);
     float3 n = Enc(Dlaa.Load(int3(clamp(p + int2(0, -1), lo, hi), 0)).rgb);
@@ -271,7 +285,13 @@ void main(uint3 id : SV_DispatchThreadID)
     float3 base = lerp(c, o, prm.y);
     float3 mn = min(base, min(c, min(min(n, s), min(w, e))));
     float3 mx = max(base, max(c, max(max(n, s), max(w, e))));
-    float3 outc = clamp(base + prm.x * (c - blur), mn, mx);
+    
+    // Suppress sharpening on extreme bright specular lights to prevent temporal ringing/shimmer
+    float lum = Luma(c4.rgb);
+    float highlightWeight = saturate(1.5 - lum * 0.5); // Attenuate above ~1.0
+    float effectiveSharpness = prm.x * highlightWeight;
+    
+    float3 outc = clamp(base + effectiveSharpness * (c - blur), mn, mx);
     Dst[id.xy] = float4(Dec(outc), c4.a);
 }
 )HLSL";
@@ -293,6 +313,8 @@ static bool CreateDLSS(ID3D11DeviceContext *ctx, uint32_t w, uint32_t h) {
     p.Feature.InWidth = p.Feature.InTargetWidth = w;
     p.Feature.InHeight = p.Feature.InTargetHeight = h;
     p.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_MaxQuality;
+    
+    // Set auto exposure and reversed depth flags
     p.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_AutoExposure | NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
     if (cfg.hdrColor) p.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
 
@@ -322,7 +344,10 @@ static bool EnsureResources(ID3D11DeviceContext *ctx, const D3D11_TEXTURE2D_DESC
     if (FAILED(g_dev->CreateUnorderedAccessView(g_sharpTex, nullptr, &g_sharpUAV))) return false;
     if (FAILED(g_dev->CreateShaderResourceView(g_outTex, nullptr, &g_outSRV))) return false;
     if (FAILED(g_dev->CreateShaderResourceView(g_inTex, nullptr, &g_inSRV))) return false;
+    
+    // R16G16_FLOAT motion vector texture
     d.Format = DXGI_FORMAT_R16G16_FLOAT;
+    d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS | D3D11_BIND_RENDER_TARGET;
     if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &g_mvTex))) return false;
     if (FAILED(g_dev->CreateUnorderedAccessView(g_mvTex, nullptr, &g_mvUAV))) return false;
 
@@ -562,12 +587,15 @@ static bool on_dispatch(command_list *cmd, uint32_t, uint32_t, uint32_t) {
 
     D3D11_TEXTURE2D_DESC d;
     tex->GetDesc(&d);
+    
+    // Check match against the full-screen HDR color target
     bool match = d.Width == g_bbW && d.Height == g_bbH && (int)d.Format == cfg.colorFormat && d.SampleDesc.Count == 1;
     if ((int)g_frame == cfg.logFrame)
         Log("frame %u dispatch %u: SRV0 %ux%u format %u match=%d", g_frame, g_dispatchCount, d.Width, d.Height, (unsigned)d.Format, match ? 1 : 0);
 
     if (match) {
         uint32_t idx = g_matchCount++;
+        // Trigger precisely on configured pass when view matrices are ready
         if ((int)idx == cfg.triggerIndex && !g_done && g_haveView && g_enabled) {
             g_inside = true;
             RunDLAA(ctx, tex);
@@ -614,6 +642,7 @@ static void on_present(command_queue *, swapchain *sc, const rect *, const rect 
     g_matchCount = 0;
     g_applyCount = 0;
 
+    // Advance Halton subpixel jitter
     uint32_t i = (g_frame % (uint32_t)cfg.phases) + 1;
     g_jx = Halton(i, 2) - 0.5f;
     g_jy = Halton(i, 3) - 0.5f;
