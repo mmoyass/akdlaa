@@ -66,6 +66,9 @@ struct Config {
     float jitterSignY = 1.0f;
     int   colorFormat = 26;      // DXGI_FORMAT_R11G11B10_FLOAT
     int   phases = 16;
+    float sharpness = 0.35f;     // 0 = off, ~0.2-0.6 typical
+    float blend = 0.0f;          // 0..1: mix of the original (un-DLAA'd) image to keep fine detail like rain
+    int   preset = 0;            // DLSS model preset: 0 default, 10 = J, 11 = K (transformer), 6 = F
 } cfg;
 
 static void LoadConfig() {
@@ -84,6 +87,9 @@ static void LoadConfig() {
     cfg.swapMatrices = I("SwapMatrices", 0) != 0;
     cfg.jitterSignX  = F("JitterSignX", 1.0f);
     cfg.jitterSignY  = F("JitterSignY", 1.0f);
+    cfg.sharpness    = F("Sharpness", 0.35f);
+    cfg.blend        = F("OriginalBlend", 0.0f);
+    cfg.preset       = I("Preset", 0);
 }
 
 // --------------------------------------------------------------- state ----
@@ -95,6 +101,11 @@ static ID3D11Texture2D *g_inTex = nullptr, *g_outTex = nullptr, *g_mvTex = nullp
 static ID3D11UnorderedAccessView *g_mvUAV = nullptr;
 static ID3D11ComputeShader *g_mvCS = nullptr;
 static ID3D11Buffer *g_mvCB = nullptr;
+static ID3D11Texture2D *g_sharpTex = nullptr;
+static ID3D11UnorderedAccessView *g_sharpUAV = nullptr;
+static ID3D11ShaderResourceView *g_outSRV = nullptr, *g_inSRV = nullptr;
+static ID3D11ComputeShader *g_postCS = nullptr;
+static ID3D11Buffer *g_postCB = nullptr;
 static ID3D11Texture2D *g_depthTex = nullptr;
 static ID3D11ShaderResourceView *g_depthSRV = nullptr;
 static uint32_t g_bbW = 0, g_bbH = 0;
@@ -214,6 +225,40 @@ void main(uint3 id : SV_DispatchThreadID)
 
 struct MVCB { float cur[16]; float prev[16]; float params[4]; };
 
+static const char *kPostShader = R"HLSL(
+cbuffer CB : register(b0) { float4 prm; };   // x=sharpness y=blend z=width w=height
+Texture2D<float4> Dlaa : register(t0);
+Texture2D<float4> Orig : register(t1);
+RWTexture2D<float4> Dst : register(u0);
+
+float3 Enc(float3 c) { return sqrt(max(c, 0.0)); }
+float3 Dec(float3 c) { return c * c; }
+
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID)
+{
+    int2 sz = int2((int)prm.z, (int)prm.w);
+    if (id.x >= (uint)sz.x || id.y >= (uint)sz.y) return;
+    int2 p = int2(id.xy);
+    int2 lo = int2(0, 0);
+    int2 hi = sz - 1;
+    float4 c4 = Dlaa.Load(int3(p, 0));
+    float3 c = Enc(c4.rgb);
+    float3 n = Enc(Dlaa.Load(int3(clamp(p + int2(0, -1), lo, hi), 0)).rgb);
+    float3 s = Enc(Dlaa.Load(int3(clamp(p + int2(0, 1), lo, hi), 0)).rgb);
+    float3 w = Enc(Dlaa.Load(int3(clamp(p + int2(-1, 0), lo, hi), 0)).rgb);
+    float3 e = Enc(Dlaa.Load(int3(clamp(p + int2(1, 0), lo, hi), 0)).rgb);
+    float3 o = Enc(Orig.Load(int3(p, 0)).rgb);
+
+    float3 blur = (n + s + w + e) * 0.25;
+    float3 base = lerp(c, o, prm.y);
+    float3 mn = min(base, min(c, min(min(n, s), min(w, e))));
+    float3 mx = max(base, max(c, max(max(n, s), max(w, e))));
+    float3 outc = clamp(base + prm.x * (c - blur), mn, mx);
+    Dst[id.xy] = float4(Dec(outc), c4.a);
+}
+)HLSL";
+
 // ------------------------------------------------------------------ NGX ----
 static bool InitNGX(ID3D11Device *dev) {
     if (NVSDK_NGX_FAILED(NVSDK_NGX_D3D11_Init_with_ProjectID(
@@ -233,6 +278,10 @@ static bool CreateDLSS(ID3D11DeviceContext *ctx, uint32_t w, uint32_t h) {
     p.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_MaxQuality;
     p.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
     if (cfg.hdrColor) p.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
+    // model preset hint (0 = default). Set for every quality mode so it applies to our 1:1 use.
+    g_ngx->Set("DLSS.Hint.Render.Preset.DLAA", (unsigned int)cfg.preset);
+    g_ngx->Set("DLSS.Hint.Render.Preset.Quality", (unsigned int)cfg.preset);
+    g_ngx->Set("DLSS.Hint.Render.Preset.UltraQuality", (unsigned int)cfg.preset);
     if (NVSDK_NGX_FAILED(NGX_D3D11_CREATE_DLSS_EXT(ctx, &g_dlss, g_ngx, &p))) return false;
     g_reset = true;
     return true;
@@ -241,6 +290,7 @@ static bool CreateDLSS(ID3D11DeviceContext *ctx, uint32_t w, uint32_t h) {
 static bool EnsureResources(ID3D11DeviceContext *ctx, const D3D11_TEXTURE2D_DESC &sd) {
     if (g_dlss && g_w == sd.Width && g_h == sd.Height && g_inTex) return true;
     Rel(g_inTex); Rel(g_outTex); Rel(g_mvTex); Rel(g_mvUAV);
+    Rel(g_sharpTex); Rel(g_sharpUAV); Rel(g_outSRV); Rel(g_inSRV);
     g_w = sd.Width; g_h = sd.Height;
 
     D3D11_TEXTURE2D_DESC d = sd;
@@ -250,6 +300,10 @@ static bool EnsureResources(ID3D11DeviceContext *ctx, const D3D11_TEXTURE2D_DESC
     if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &g_inTex))) return false;
     d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
     if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &g_outTex))) return false;
+    if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &g_sharpTex))) return false;
+    if (FAILED(g_dev->CreateUnorderedAccessView(g_sharpTex, nullptr, &g_sharpUAV))) return false;
+    if (FAILED(g_dev->CreateShaderResourceView(g_outTex, nullptr, &g_outSRV))) return false;
+    if (FAILED(g_dev->CreateShaderResourceView(g_inTex, nullptr, &g_inSRV))) return false;
     d.Format = DXGI_FORMAT_R16G16_FLOAT;
     if (FAILED(g_dev->CreateTexture2D(&d, nullptr, &g_mvTex))) return false;
     if (FAILED(g_dev->CreateUnorderedAccessView(g_mvTex, nullptr, &g_mvUAV))) return false;
@@ -272,6 +326,25 @@ static bool EnsureResources(ID3D11DeviceContext *ctx, const D3D11_TEXTURE2D_DESC
         bd.Usage = D3D11_USAGE_DEFAULT;
         bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         if (FAILED(g_dev->CreateBuffer(&bd, nullptr, &g_mvCB))) return false;
+    }
+    if (!g_postCS) {
+        ID3DBlob *blob = nullptr, *err = nullptr;
+        HRESULT hr = D3DCompile(kPostShader, strlen(kPostShader), "post", nullptr, nullptr, "main", "cs_5_0", 0, 0, &blob, &err);
+        if (FAILED(hr)) {
+            Log("post shader compile failed: %s", err ? (const char *)err->GetBufferPointer() : "unknown");
+            Rel(err);
+            return false;
+        }
+        hr = g_dev->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &g_postCS);
+        Rel(blob); Rel(err);
+        if (FAILED(hr)) return false;
+    }
+    if (!g_postCB) {
+        D3D11_BUFFER_DESC bd = {};
+        bd.ByteWidth = 16;
+        bd.Usage = D3D11_USAGE_DEFAULT;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        if (FAILED(g_dev->CreateBuffer(&bd, nullptr, &g_postCB))) return false;
     }
     return CreateDLSS(ctx, g_w, g_h);
 }
@@ -387,7 +460,22 @@ static void RunDLAA(ID3D11DeviceContext *ctx, ID3D11Texture2D *scene) {
     e.Feature.InSharpness = 0.0f;
 
     if (NVSDK_NGX_SUCCEED(NGX_D3D11_EVALUATE_DLSS_EXT(ctx, g_dlss, g_ngx, &e))) {
-        ctx->CopyResource(scene, g_outTex);
+        if (cfg.sharpness > 0.001f || cfg.blend > 0.001f) {
+            float pc[4] = {cfg.sharpness, cfg.blend, (float)g_w, (float)g_h};
+            ctx->UpdateSubresource(g_postCB, 0, nullptr, pc, 0, 0);
+            ctx->CSSetShader(g_postCS, nullptr, 0);
+            ctx->CSSetConstantBuffers(0, 1, &g_postCB);
+            ID3D11ShaderResourceView *sv[2] = {g_outSRV, g_inSRV};
+            ctx->CSSetShaderResources(0, 2, sv);
+            ctx->CSSetUnorderedAccessViews(0, 1, &g_sharpUAV, &ic);
+            ctx->Dispatch((g_w + 7) / 8, (g_h + 7) / 8, 1);
+            ctx->CSSetUnorderedAccessViews(0, 1, &nu, &ic);
+            ID3D11ShaderResourceView *none[2] = {nullptr, nullptr};
+            ctx->CSSetShaderResources(0, 2, none);
+            ctx->CopyResource(scene, g_sharpTex);
+        } else {
+            ctx->CopyResource(scene, g_outTex);
+        }
         if (g_reset) Log("DLAA ran for the first time at frame %u, dispatch %u", g_frame, g_dispatchCount);
         g_reset = false;
     } else {
@@ -415,6 +503,7 @@ static void on_destroy_device(device *) {
     g_dlss = nullptr; g_ngx = nullptr;
     Rel(g_inTex); Rel(g_outTex); Rel(g_mvTex); Rel(g_mvUAV);
     Rel(g_mvCS); Rel(g_mvCB); Rel(g_depthSRV); Rel(g_depthTex);
+    Rel(g_sharpTex); Rel(g_sharpUAV); Rel(g_outSRV); Rel(g_inSRV); Rel(g_postCS); Rel(g_postCB);
 }
 
 static void on_bind_rt(command_list *cmd, uint32_t, const resource_view *, resource_view dsv) {
@@ -488,8 +577,8 @@ static void on_present(command_queue *, swapchain *sc, const rect *, const rect 
         g_w = 0;               // forces the DLSS feature to be recreated
         g_reset = true;
         g_failed = (g_ngx == nullptr);
-        Log("F10: reloaded ini: TriggerIndex=%d HDR=%d Jitter=%d SignX=%.0f SignY=%.0f Swap=%d",
-            cfg.triggerIndex, cfg.hdrColor ? 1 : 0, cfg.applyJitter ? 1 : 0, cfg.jitterSignX, cfg.jitterSignY, cfg.swapMatrices ? 1 : 0);
+        Log("F10: reloaded ini: TriggerIndex=%d HDR=%d Jitter=%d SignX=%.0f SignY=%.0f Swap=%d Sharp=%.2f Blend=%.2f Preset=%d",
+            cfg.triggerIndex, cfg.hdrColor ? 1 : 0, cfg.applyJitter ? 1 : 0, cfg.jitterSignX, cfg.jitterSignY, cfg.swapMatrices ? 1 : 0, cfg.sharpness, cfg.blend, cfg.preset);
     }
     prev9 = d9;
     prev10 = d10;
