@@ -1,20 +1,11 @@
-// Arkham Knight DLAA v2 - ReShade addon (DX11) + NVIDIA NGX.  UNTESTED.
-// Camera-only motion vectors: moving characters/objects have no vectors and will ghost.
-//
-// Per-view constant buffer layout (float4 index), found with RenderDoc:
-//   0..3   current ViewProj   clip = c0*x + c1*y + c2*z + c3   (positions relative to camera)
-//   4..7   previous ViewProj  (assumed)
-//   8      (0,0,0,1)
-//   9      PreViewTranslation (-camera position)
-//   10     camera position, w=1
-//   11..14 view matrix, 15..18 inverse view (18 = camera position, w=1)
-//   20     (-near, 1, ...)   near = 10, infinite far, depth = 1 - near / viewZ
-//   22     (width, height, 1/width, 1/height)
+// Arkham Knight DLAA - ReShade Addon (DX11) + NVIDIA NGX
+// Clean camera motion vector generation & unjittered reprojection
 
 #define NOMINMAX
 #include <windows.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
+#include <DirectXMath.h>
 #include <reshade.hpp>
 #include <nvsdk_ngx_defs.h>
 #include <nvsdk_ngx_params.h>
@@ -28,10 +19,11 @@
 #include <string>
 #include <unordered_map>
 
-extern "C" __declspec(dllexport) const char *NAME = "AK DLAA";
-extern "C" __declspec(dllexport) const char *DESCRIPTION = "DLAA for Batman: Arkham Knight (camera-motion vectors)";
-
+using namespace DirectX;
 using namespace reshade::api;
+
+extern "C" __declspec(dllexport) const char *NAME = "AK DLAA";
+extern "C" __declspec(dllexport) const char *DESCRIPTION = "Clean DLAA for Batman: Arkham Knight";
 
 // ------------------------------------------------------------ helpers ----
 static std::string ExeDir() {
@@ -57,18 +49,18 @@ template <class T> static void Rel(T *&p) { if (p) { p->Release(); p = nullptr; 
 
 // -------------------------------------------------------------- config ----
 struct Config {
-    int   triggerIndex = 0;      // run at the Nth compute pass that reads the HDR scene (0 = first)
-    int   logFrame = 300;        // write a diagnostic list of compute passes on this frame (-1 = off)
+    int   triggerIndex = 2;
+    int   logFrame = 300;
     bool  hdrColor = true;
     bool  applyJitter = true;
-    bool  swapMatrices = false;  // true: treat floats 4..7 as current and 0..3 as previous
-    float jitterSignX = 1.0f;    // sign of the jitter passed to DLSS
+    bool  swapMatrices = false;
+    float jitterSignX = 1.0f;
     float jitterSignY = 1.0f;
-    int   colorFormat = 26;      // DXGI_FORMAT_R11G11B10_FLOAT
+    int   colorFormat = 26; // DXGI_FORMAT_R11G11B10_FLOAT
     int   phases = 16;
-    float sharpness = 0.35f;     // 0 = off, ~0.2-0.6 typical
-    float blend = 0.0f;          // 0..1: mix of the original (un-DLAA'd) image to keep fine detail like rain
-    int   preset = 0;            // DLSS model preset: 0 default, 10 = J, 11 = K (transformer), 6 = F
+    float sharpness = 0.35f;
+    float blend = 0.0f;
+    int   preset = 11;      // Preset K
 } cfg;
 
 static void LoadConfig() {
@@ -80,7 +72,7 @@ static void LoadConfig() {
         GetPrivateProfileStringA("dlaa", k, def, buf, 32, ini.c_str());
         return (float)atof(buf);
     };
-    cfg.triggerIndex = I("TriggerIndex", 0);
+    cfg.triggerIndex = I("TriggerIndex", 2);
     cfg.logFrame     = I("LogFrame", 300);
     cfg.hdrColor     = I("HDRColor", 1) != 0;
     cfg.applyJitter  = I("ApplyJitter", 1) != 0;
@@ -89,7 +81,7 @@ static void LoadConfig() {
     cfg.jitterSignY  = F("JitterSignY", 1.0f);
     cfg.sharpness    = F("Sharpness", 0.35f);
     cfg.blend        = F("OriginalBlend", 0.0f);
-    cfg.preset       = I("Preset", 0);
+    cfg.preset       = I("Preset", 11);
 }
 
 // --------------------------------------------------------------- state ----
@@ -113,14 +105,19 @@ static uint32_t g_frame = 0, g_dispatchCount = 0, g_matchCount = 0;
 static bool g_done = false, g_reset = true, g_haveView = false, g_failed = false, g_inside = false;
 static bool g_enabled = true;
 static uint32_t g_applyCount = 0;
-static float g_curVP[16], g_prevVP[16];
+
+// Matrices (Column-major storage matching UE3)
+static XMFLOAT4X4 g_curVP;
+static XMFLOAT4X4 g_prevVP;
+static XMFLOAT4X4 g_invCurVP;
+
 static float g_near = 10.0f;
-static float g_jx = 0, g_jy = 0;
+static float g_jx = 0.0f, g_jy = 0.0f;
 static std::mutex g_mtx;
 static std::unordered_map<uint64_t, void *> g_mapped;
 
 static float Halton(uint32_t i, uint32_t b) {
-    float f = 1, r = 0;
+    float f = 1.0f, r = 0.0f;
     while (i > 0) { f /= b; r += f * (i % b); i /= b; }
     return r;
 }
@@ -129,10 +126,10 @@ static float Halton(uint32_t i, uint32_t b) {
 static bool LooksLikeView(const float *c, size_t bytes) {
     if (bytes < 23 * 16) return false;
     const float *v8 = c + 8 * 4, *v10 = c + 10 * 4, *v18 = c + 18 * 4, *v22 = c + 22 * 4;
-    if (!(v8[0] == 0 && v8[1] == 0 && v8[2] == 0 && v8[3] == 1)) return false;
-    if (!(v10[3] == 1 && v18[3] == 1)) return false;
-    if (!(v22[0] >= 320 && v22[0] <= 16384 && v22[1] >= 240 && v22[1] <= 16384)) return false;
-    if (fabsf(v22[0] * v22[2] - 1) > 0.01f || fabsf(v22[1] * v22[3] - 1) > 0.01f) return false;
+    if (!(v8[0] == 0.0f && v8[1] == 0.0f && v8[2] == 0.0f && v8[3] == 1.0f)) return false;
+    if (!(v10[3] == 1.0f && v18[3] == 1.0f)) return false;
+    if (!(v22[0] >= 320.0f && v22[0] <= 16384.0f && v22[1] >= 240.0f && v22[1] <= 16384.0f)) return false;
+    if (fabsf(v22[0] * v22[2] - 1.0f) > 0.01f || fabsf(v22[1] * v22[3] - 1.0f) > 0.01f) return false;
     if (g_bbW && ((uint32_t)v22[0] != g_bbW || (uint32_t)v22[1] != g_bbH)) return false;
     return true;
 }
@@ -140,17 +137,31 @@ static bool LooksLikeView(const float *c, size_t bytes) {
 static void ProcessViewConstants(float *c, size_t bytes) {
     if (!LooksLikeView(c, bytes)) return;
     std::lock_guard<std::mutex> lock(g_mtx);
-    int curI = cfg.swapMatrices ? 4 : 0, prevI = cfg.swapMatrices ? 0 : 4;
-    memcpy(g_curVP, c + curI * 4, 64);   // unjittered copies for motion vectors
-    memcpy(g_prevVP, c + prevI * 4, 64);
+
+    int curI = cfg.swapMatrices ? 4 : 0;
+    int prevI = cfg.swapMatrices ? 0 : 4;
+
+    // Load matrices without any jitter
+    XMMATRIX curMat = XMLoadFloat4x4(reinterpret_cast<const XMFLOAT4X4 *>(c + curI * 4));
+    XMMATRIX prevMat = XMLoadFloat4x4(reinterpret_cast<const XMFLOAT4X4 *>(c + prevI * 4));
+
+    XMVECTOR det;
+    XMMATRIX invCurMat = XMMatrixInverse(&det, curMat);
+
+    XMStoreFloat4x4(&g_curVP, curMat);
+    XMStoreFloat4x4(&g_prevVP, prevMat);
+    XMStoreFloat4x4(&g_invCurVP, invCurMat);
+
     float nz = fabsf(c[20 * 4]);
     if (nz > 0.01f && nz < 10000.0f) g_near = nz;
     g_haveView = true;
+
+    // Apply subpixel camera jitter only to the buffer being sent to rendering
     if (cfg.applyJitter && g_enabled && g_bbW) {
         ++g_applyCount;
-        // clip.xy += jitter_ndc * clip.w  ->  col.xy += jitter_ndc * col.w for each of the 4 columns
         float jx = 2.0f * g_jx / (float)g_bbW;
         float jy = -2.0f * g_jy / (float)g_bbH;
+
         for (int k = 0; k < 4; ++k) {
             float *col = c + (curI + k) * 4;
             col[0] += jx * col[3];
@@ -186,11 +197,17 @@ static bool on_update_buffer_region(device *, const void *data, resource, uint64
 }
 
 // --------------------------------------------------------------- shaders ----
+struct MVCB {
+    XMFLOAT4X4 InvCurViewProj;
+    XMFLOAT4X4 PrevViewProj;
+    float params[4]; // x=width, y=height, z=near, w=unused
+};
+
 static const char *kMVShader = R"HLSL(
 cbuffer CB : register(b0) {
-    float4 cur[4];
-    float4 prv[4];
-    float4 prm;      // x=width y=height z=near
+    float4x4 InvCurViewProj;
+    float4x4 PrevViewProj;
+    float4 prm;
 };
 Texture2D<float> Depth : register(t0);
 RWTexture2D<float2> MV : register(u0);
@@ -199,34 +216,34 @@ RWTexture2D<float2> MV : register(u0);
 void main(uint3 id : SV_DispatchThreadID)
 {
     if (id.x >= (uint)prm.x || id.y >= (uint)prm.y) return;
-    float d = Depth.Load(int3(id.xy, 0));
+    
+    float depth = Depth.Load(int3(id.xy, 0));
     float2 uv = (float2(id.xy) + 0.5) / prm.xy;
-    float2 ndc = float2(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0);
-    float w = prm.z / max(1.0 - d, 1e-6);
-
-    // rows of the current matrix (x, y, w)
-    float3 r0 = float3(cur[0].x, cur[1].x, cur[2].x);
-    float3 r1 = float3(cur[0].y, cur[1].y, cur[2].y);
-    float3 r3 = float3(cur[0].w, cur[1].w, cur[2].w);
-    float3 rhs = float3(ndc.x * w - cur[3].x, ndc.y * w - cur[3].y, w - cur[3].w);
-    float det = dot(r0, cross(r1, r3));
-    float3 p = (rhs.x * cross(r1, r3) + rhs.y * cross(r3, r0) + rhs.z * cross(r0, r1)) / det;
-
-    float4 pc = prv[0] * p.x + prv[1] * p.y + prv[2] * p.z + prv[3];
-    float2 mv = float2(0, 0);
-    if (pc.w > 1e-4) {
-        float2 pn = pc.xy / pc.w;
-        float2 puv = float2(pn.x * 0.5 + 0.5, 0.5 - pn.y * 0.5);
-        mv = (puv - uv) * prm.xy;     // pixels, pointing to the previous-frame position
+    
+    // Arkham Knight Reversed-Z NDC [-1..1, 1..-1, depth..1]
+    float4 clipCurr = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, depth, 1.0);
+    
+    // Unproject to camera-relative world space
+    float4 worldPos = mul(clipCurr, InvCurViewProj);
+    worldPos /= worldPos.w;
+    
+    // Reproject to previous frame's clip space
+    float4 clipPrev = mul(worldPos, PrevViewProj);
+    
+    float2 mv = float2(0.0, 0.0);
+    if (clipPrev.w > 1e-5) {
+        float2 prevNDC = clipPrev.xy / clipPrev.w;
+        float2 prevUV = float2(prevNDC.x * 0.5 + 0.5, 0.5 - prevNDC.y * 0.5);
+        
+        // NVIDIA NGX convention: Current - Previous in normalized UV space
+        mv = uv - prevUV;
     }
     MV[id.xy] = mv;
 }
 )HLSL";
 
-struct MVCB { float cur[16]; float prev[16]; float params[4]; };
-
 static const char *kPostShader = R"HLSL(
-cbuffer CB : register(b0) { float4 prm; };   // x=sharpness y=blend z=width w=height
+cbuffer CB : register(b0) { float4 prm; }; // x=sharpness, y=blend, z=width, w=height
 Texture2D<float4> Dlaa : register(t0);
 Texture2D<float4> Orig : register(t1);
 RWTexture2D<float4> Dst : register(u0);
@@ -276,12 +293,13 @@ static bool CreateDLSS(ID3D11DeviceContext *ctx, uint32_t w, uint32_t h) {
     p.Feature.InWidth = p.Feature.InTargetWidth = w;
     p.Feature.InHeight = p.Feature.InTargetHeight = h;
     p.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_MaxQuality;
-    p.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
+    p.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_AutoExposure | NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
     if (cfg.hdrColor) p.InFeatureCreateFlags |= NVSDK_NGX_DLSS_Feature_Flags_IsHDR;
-    // model preset hint (0 = default). Set for every quality mode so it applies to our 1:1 use.
+
     g_ngx->Set("DLSS.Hint.Render.Preset.DLAA", (unsigned int)cfg.preset);
     g_ngx->Set("DLSS.Hint.Render.Preset.Quality", (unsigned int)cfg.preset);
     g_ngx->Set("DLSS.Hint.Render.Preset.UltraQuality", (unsigned int)cfg.preset);
+
     if (NVSDK_NGX_FAILED(NGX_D3D11_CREATE_DLSS_EXT(ctx, &g_dlss, g_ngx, &p))) return false;
     g_reset = true;
     return true;
@@ -366,7 +384,6 @@ static void SetDepth(ID3D11Texture2D *t) {
     g_depthTex = t;
 }
 
-// Save/restore the pipeline state that our passes and NGX may overwrite.
 struct StateBlock {
     ID3D11ComputeShader *cs = nullptr;
     ID3D11ShaderResourceView *srv[16] = {};
@@ -421,16 +438,20 @@ static void RunDLAA(ID3D11DeviceContext *ctx, ID3D11Texture2D *scene) {
 
     StateBlock st;
     st.Save(ctx);
-    ctx->OMSetRenderTargets(0, nullptr, nullptr);   // depth must not still be bound as DSV
+    ctx->OMSetRenderTargets(0, nullptr, nullptr);
 
-    // 1) camera-motion vectors from depth + the two view-projection matrices
+    // 1) Compute unjittered camera motion vectors
     MVCB cb;
     {
         std::lock_guard<std::mutex> lock(g_mtx);
-        memcpy(cb.cur, g_curVP, 64);
-        memcpy(cb.prev, g_prevVP, 64);
+        cb.InvCurViewProj = g_invCurVP;
+        cb.PrevViewProj   = g_prevVP;
     }
-    cb.params[0] = (float)g_w; cb.params[1] = (float)g_h; cb.params[2] = g_near; cb.params[3] = 0;
+    cb.params[0] = (float)g_w;
+    cb.params[1] = (float)g_h;
+    cb.params[2] = g_near;
+    cb.params[3] = 0.0f;
+
     ctx->UpdateSubresource(g_mvCB, 0, nullptr, &cb, 0, 0);
     ctx->CSSetShader(g_mvCS, nullptr, 0);
     ctx->CSSetConstantBuffers(0, 1, &g_mvCB);
@@ -438,12 +459,13 @@ static void RunDLAA(ID3D11DeviceContext *ctx, ID3D11Texture2D *scene) {
     UINT ic = 0xFFFFFFFFu;
     ctx->CSSetUnorderedAccessViews(0, 1, &g_mvUAV, &ic);
     ctx->Dispatch((g_w + 7) / 8, (g_h + 7) / 8, 1);
+
     ID3D11UnorderedAccessView *nu = nullptr;
     ctx->CSSetUnorderedAccessViews(0, 1, &nu, &ic);
     ID3D11ShaderResourceView *ns = nullptr;
     ctx->CSSetShaderResources(0, 1, &ns);
 
-    // 2) DLSS at native resolution (= DLAA)
+    // 2) DLSS Evaluation
     ctx->CopyResource(g_inTex, scene);
     NVSDK_NGX_D3D11_DLSS_Eval_Params e = {};
     e.Feature.pInColor = g_inTex;
@@ -452,7 +474,7 @@ static void RunDLAA(ID3D11DeviceContext *ctx, ID3D11Texture2D *scene) {
     e.pInMotionVectors = g_mvTex;
     e.InJitterOffsetX = cfg.jitterSignX * g_jx;
     e.InJitterOffsetY = cfg.jitterSignY * g_jy;
-    e.InRenderSubrectDimensions = {g_w, g_h};
+    e.InRenderSubrectDimensions = { g_w, g_h };
     e.InReset = g_reset ? 1 : 0;
     e.InMVScaleX = 1.0f;
     e.InMVScaleY = 1.0f;
@@ -461,22 +483,22 @@ static void RunDLAA(ID3D11DeviceContext *ctx, ID3D11Texture2D *scene) {
 
     if (NVSDK_NGX_SUCCEED(NGX_D3D11_EVALUATE_DLSS_EXT(ctx, g_dlss, g_ngx, &e))) {
         if (cfg.sharpness > 0.001f || cfg.blend > 0.001f) {
-            float pc[4] = {cfg.sharpness, cfg.blend, (float)g_w, (float)g_h};
+            float pc[4] = { cfg.sharpness, cfg.blend, (float)g_w, (float)g_h };
             ctx->UpdateSubresource(g_postCB, 0, nullptr, pc, 0, 0);
             ctx->CSSetShader(g_postCS, nullptr, 0);
             ctx->CSSetConstantBuffers(0, 1, &g_postCB);
-            ID3D11ShaderResourceView *sv[2] = {g_outSRV, g_inSRV};
+            ID3D11ShaderResourceView *sv[2] = { g_outSRV, g_inSRV };
             ctx->CSSetShaderResources(0, 2, sv);
             ctx->CSSetUnorderedAccessViews(0, 1, &g_sharpUAV, &ic);
             ctx->Dispatch((g_w + 7) / 8, (g_h + 7) / 8, 1);
             ctx->CSSetUnorderedAccessViews(0, 1, &nu, &ic);
-            ID3D11ShaderResourceView *none[2] = {nullptr, nullptr};
+            ID3D11ShaderResourceView *none[2] = { nullptr, nullptr };
             ctx->CSSetShaderResources(0, 2, none);
             ctx->CopyResource(scene, g_sharpTex);
         } else {
             ctx->CopyResource(scene, g_outTex);
         }
-        if (g_reset) Log("DLAA ran for the first time at frame %u, dispatch %u", g_frame, g_dispatchCount);
+        if (g_reset) Log("DLAA running stably at frame %u, dispatch %u", g_frame, g_dispatchCount);
         g_reset = false;
     } else {
         Log("DLSS evaluate failed at frame %u", g_frame);
@@ -515,7 +537,6 @@ static void on_bind_rt(command_list *cmd, uint32_t, const resource_view *, resou
         return;
     D3D11_TEXTURE2D_DESC d;
     t->GetDesc(&d);
-    // scene depth: D32S8 typeless, same size as the back buffer
     if (d.Format == DXGI_FORMAT_R32G8X24_TYPELESS && d.Width == g_bbW && d.Height == g_bbH && d.SampleDesc.Count == 1)
         SetDepth(t);
     t->Release();
@@ -563,7 +584,6 @@ static void on_present(command_queue *, swapchain *sc, const rect *, const rect 
     g_bbW = rd.texture.width;
     g_bbH = rd.texture.height;
 
-    // hotkeys: F9 = DLAA on/off, F10 = reload dlaa.ini
     static bool prev9 = false, prev10 = false;
     bool d9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
     bool d10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
@@ -574,7 +594,7 @@ static void on_present(command_queue *, swapchain *sc, const rect *, const rect 
     }
     if (d10 && !prev10) {
         LoadConfig();
-        g_w = 0;               // forces the DLSS feature to be recreated
+        g_w = 0;
         g_reset = true;
         g_failed = (g_ngx == nullptr);
         Log("F10: reloaded ini: TriggerIndex=%d HDR=%d Jitter=%d SignX=%.0f SignY=%.0f Swap=%d Sharp=%.2f Blend=%.2f Preset=%d",
@@ -593,6 +613,7 @@ static void on_present(command_queue *, swapchain *sc, const rect *, const rect 
     g_dispatchCount = 0;
     g_matchCount = 0;
     g_applyCount = 0;
+
     uint32_t i = (g_frame % (uint32_t)cfg.phases) + 1;
     g_jx = Halton(i, 2) - 0.5f;
     g_jy = Halton(i, 3) - 0.5f;
